@@ -199,3 +199,111 @@ def test_event_mix_roughly_follows_weights() -> None:
     mix = Counter(e.event_type for e in events)
     assert mix[EventType.ORDER] > mix[EventType.PAYMENT] > mix[EventType.REFUND]
     assert mix[EventType.REFUND] / len(events) < 0.05
+
+
+class TestSchemaVersionMix:
+    """A stream carrying only the newest version never exercises the
+    consumer's backward-compatibility path, which is the path most likely to
+    rot unnoticed."""
+
+    def test_both_order_versions_are_emitted(self) -> None:
+        versions = {
+            e.schema_version for e in _gen().generate(2000) if e.event_type is EventType.ORDER
+        }
+        assert versions == {1, 2}
+
+    def test_v1_orders_carry_no_channel_field(self) -> None:
+        for event in _gen().generate(2000):
+            if event.event_type is EventType.ORDER and event.schema_version == 1:
+                assert "channel" not in event.payload
+
+    def test_v2_orders_carry_a_channel(self) -> None:
+        seen = False
+        for event in _gen().generate(2000):
+            if event.event_type is EventType.ORDER and event.schema_version == 2:
+                assert event.payload["channel"]
+                seen = True
+        assert seen
+
+    def test_the_mix_can_be_turned_off(self) -> None:
+        versions = {
+            e.schema_version
+            for e in _gen(v1_order_rate=0.0).generate(800)
+            if e.event_type is EventType.ORDER
+        }
+        assert versions == {2}
+
+    def test_invalid_v1_rate_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="v1_order_rate must be a fraction"):
+            GeneratorConfig(v1_order_rate=2.0)
+
+
+class TestPaymentAttribution:
+    def test_payment_credits_the_customer_who_placed_the_order(self) -> None:
+        """A payment attributed to an unrelated customer would corrupt every
+        per-customer aggregate while passing referential integrity checks."""
+        gen = _gen()
+        events = gen.generate(4000)
+        orders = {
+            e.payload["order_id"]: e.payload["customer_id"]
+            for e in events
+            if e.event_type is EventType.ORDER
+        }
+        payments = [e for e in events if e.event_type is EventType.PAYMENT]
+        assert payments
+        for payment in payments:
+            assert payment.payload["customer_id"] == orders[payment.payload["order_id"]]
+
+    def test_each_order_is_paid_at_most_once(self) -> None:
+        events = _gen().generate(6000)
+        paid = [e.payload["order_id"] for e in events if e.event_type is EventType.PAYMENT]
+        assert len(paid) == len(set(paid))
+
+
+class TestSelectionIndexInvariants:
+    """The O(1) indexes are only safe if their position maps stay in sync with
+    their lists; a stale index would hand out a wrong or missing id."""
+
+    def test_position_maps_stay_consistent(self) -> None:
+        gen = _gen()
+        gen.generate(5000)
+        assert len(gen._unpaid) == len(gen._unpaid_at)
+        assert all(gen._unpaid[i] == oid for oid, i in gen._unpaid_at.items())
+        assert len(gen._refundable) == len(gen._refundable_at)
+        assert all(gen._refundable[i] == pid for pid, i in gen._refundable_at.items())
+
+    def test_fully_refunded_payments_leave_the_pool(self) -> None:
+        gen = _gen()
+        gen.generate(5000)
+        for payment_id in gen._refundable:
+            _, captured = gen.state.payments[payment_id]
+            already = gen.state.refunded.get(payment_id, Decimal("0.00"))
+            assert captured - already > Decimal("0.01")
+
+    def test_unpaid_pool_holds_only_unpaid_orders(self) -> None:
+        gen = _gen()
+        gen.generate(5000)
+        paid = {order_id for order_id, _ in gen.state.payments.values()}
+        assert not (set(gen._unpaid) & paid)
+
+
+@pytest.mark.performance
+class TestThroughput:
+    def test_generation_is_linear_not_quadratic(self) -> None:
+        """Regression guard for the O(n^2) selection this replaced.
+
+        Asserts only that per-event cost does not blow up with stream length,
+        not an absolute rate, so the test does not fail on a slow CI runner.
+        """
+        import time
+
+        def rate(count: int) -> float:
+            gen = _gen()
+            started = time.perf_counter()
+            gen.generate(count)
+            return count / (time.perf_counter() - started)
+
+        small = rate(2_000)
+        large = rate(50_000)
+        # Before the fix this ratio was ~50x. Linear work keeps it near 1.
+        assert small / large < 4.0, f"throughput degraded {small / large:.1f}x with scale"

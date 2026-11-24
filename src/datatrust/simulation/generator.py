@@ -23,12 +23,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from datatrust.contracts.base import EventEnvelope, EventType
+from datatrust.contracts.base import EventEnvelope, EventPayload, EventType
 from datatrust.contracts.events import (
     Currency,
     CustomerUpdatedV1,
     InventoryUpdatedV1,
     OrderLine,
+    OrderPlacedV1,
     OrderPlacedV2,
     PaymentCapturedV1,
     PaymentStatus,
@@ -65,12 +66,27 @@ class GeneratorConfig:
     natural_lateness_rate: float = 0.05
     max_natural_lateness_seconds: int = 120
 
+    # Share of orders emitted at the older v1 schema. A stream that only ever
+    # carries the newest version never exercises the consumer's backward
+    # compatibility path, which is the path most likely to rot unnoticed.
+    v1_order_rate: float = 0.15
+
+    # How far back the generator looks when choosing an order to pay or a
+    # payment to refund. Bounded so selection stays O(1) in stream length.
+    recency_window: int = 200
+
     def __post_init__(self) -> None:
         if self.customer_count < 1 or self.product_count < 1:
             msg = "customer_count and product_count must be positive"
             raise ValueError(msg)
         if not 0.0 <= self.natural_lateness_rate <= 1.0:
             msg = "natural_lateness_rate must be a fraction between 0 and 1"
+            raise ValueError(msg)
+        if not 0.0 <= self.v1_order_rate <= 1.0:
+            msg = "v1_order_rate must be a fraction between 0 and 1"
+            raise ValueError(msg)
+        if self.recency_window < 1:
+            msg = "recency_window must be positive"
             raise ValueError(msg)
         if self.total_weight <= 0:
             msg = "at least one event weight must be positive"
@@ -152,6 +168,19 @@ class EventGenerator:
             product: Decimal(str(self._rng.randrange(199, 49999))) / 100
             for product in self._products
         }
+        # Selection indexes. Picking "an unpaid order" or "a refundable
+        # payment" by filtering the whole world on every event is O(n) per
+        # call and O(n^2) per run, which made the generator unusable past a
+        # few thousand events. These keep both choices O(1): a list for
+        # random access plus a position map so removal is a swap with the
+        # last element instead of a scan.
+        self._unpaid: list[str] = []
+        self._unpaid_at: dict[str, int] = {}
+        self._refundable: list[str] = []
+        self._refundable_at: dict[str, int] = {}
+        # order_id -> customer_id, so a payment credits the customer who
+        # actually placed the order rather than an unrelated one.
+        self._order_customer: dict[str, str] = {}
 
     # -- public API ---------------------------------------------------------
 
@@ -218,27 +247,41 @@ class EventGenerator:
         gross = sum((line.line_total for line in lines), start=Decimal("0.00"))
 
         event_time = self._event_time()
-        payload = OrderPlacedV2(
-            order_id=order_id,
-            customer_id=customer_id,
-            order_timestamp=event_time,
-            currency=Currency.USD,
-            lines=lines,
-            gross_amount=gross,
-            channel=self._rng.choice(list(SalesChannel)),
-        )
+        payload: OrderPlacedV1 | OrderPlacedV2
+        if self._rng.random() < self.config.v1_order_rate:
+            # Older producers still on v1. The consumer must read these via
+            # the registry's backward-compatibility path.
+            payload = OrderPlacedV1(
+                order_id=order_id,
+                customer_id=customer_id,
+                order_timestamp=event_time,
+                currency=Currency.USD,
+                lines=lines,
+                gross_amount=gross,
+            )
+            version = 1
+        else:
+            payload = OrderPlacedV2(
+                order_id=order_id,
+                customer_id=customer_id,
+                order_timestamp=event_time,
+                currency=Currency.USD,
+                lines=lines,
+                gross_amount=gross,
+                channel=self._rng.choice(list(SalesChannel)),
+            )
+            version = 2
+
         self.state.orders[order_id] = gross
-        return self._envelope(payload, entity_id=order_id, event_time=event_time, version=2)
+        self._order_customer[order_id] = customer_id
+        self._track_unpaid(order_id)
+        return self._envelope(payload, entity_id=order_id, event_time=event_time, version=version)
 
     def _payment(self) -> EventEnvelope | None:
-        unpaid = [
-            order_id
-            for order_id in self.state.orders
-            if order_id not in {oid for oid, _ in self.state.payments.values()}
-        ]
-        if not unpaid:
+        order_id = self._take_recent(self._unpaid, self._unpaid_at)
+        if order_id is None:
             return None
-        order_id = self._rng.choice(unpaid[-200:])  # recent orders, bounded scan
+
         payment_id = f"pay-{self._next_sequence():09d}"
         amount = self.state.orders[order_id]
         event_time = self._event_time()
@@ -246,30 +289,33 @@ class EventGenerator:
         payload = PaymentCapturedV1(
             payment_id=payment_id,
             order_id=order_id,
-            customer_id=f"cus-{self._rng.randrange(self.config.customer_count):05d}",
+            customer_id=self._order_customer[order_id],
             captured_at=event_time,
             currency=Currency.USD,
             status=PaymentStatus.CAPTURED,
             amount=amount,
         )
         self.state.payments[payment_id] = (order_id, amount)
+        if amount > Decimal("0.01"):
+            self._track_refundable(payment_id)
         return self._envelope(payload, entity_id=payment_id, event_time=event_time)
 
     def _refund(self) -> EventEnvelope | None:
-        if not self.state.payments:
+        payment_id = self._peek_recent(self._refundable)
+        if payment_id is None:
             return None
-        payment_id = self._rng.choice(list(self.state.payments)[-200:])
+
         order_id, captured = self.state.payments[payment_id]
         already = self.state.refunded.get(payment_id, Decimal("0.00"))
         remaining = captured - already
         if remaining <= Decimal("0.01"):
+            self._drop(payment_id, self._refundable, self._refundable_at)
             return None
 
         # Partial or full, but never more than was captured. Over-refunding is
         # a failure the Failure Lab injects on purpose, not an accident here.
-        amount = (remaining * Decimal(self._rng.choice(["0.25", "0.50", "1.00"]))).quantize(
-            Decimal("0.01")
-        )
+        fraction = Decimal(self._rng.choice(["0.25", "0.50", "1.00"]))
+        amount = (remaining * fraction).quantize(Decimal("0.01"))
         if amount <= Decimal("0.00"):
             return None
 
@@ -285,6 +331,8 @@ class EventGenerator:
             reason=self._rng.choice(_REFUND_REASONS),
         )
         self.state.refunded[payment_id] = already + amount
+        if captured - (already + amount) <= Decimal("0.01"):
+            self._drop(payment_id, self._refundable, self._refundable_at)
         return self._envelope(payload, entity_id=refund_id, event_time=event_time)
 
     def _customer(self) -> EventEnvelope:
@@ -329,11 +377,7 @@ class EventGenerator:
 
     def _envelope(
         self,
-        payload: OrderPlacedV2
-        | PaymentCapturedV1
-        | RefundIssuedV1
-        | CustomerUpdatedV1
-        | InventoryUpdatedV1,
+        payload: EventPayload,
         *,
         entity_id: str,
         event_time: datetime,
@@ -349,6 +393,64 @@ class EventGenerator:
             producer="event-generator",
             payload=payload.model_dump(mode="json"),
         )
+
+    # -- O(1) selection indexes ---------------------------------------------
+
+    def _track_unpaid(self, order_id: str) -> None:
+        self._unpaid_at[order_id] = len(self._unpaid)
+        self._unpaid.append(order_id)
+
+    def _track_refundable(self, payment_id: str) -> None:
+        self._refundable_at[payment_id] = len(self._refundable)
+        self._refundable.append(payment_id)
+
+    def _pick_recent_index(self, pool: list[str]) -> int | None:
+        """Index of a randomly chosen member of the pool's recent tail.
+
+        Biased toward recent entries because a payment usually follows its
+        order closely, and because an unbounded window would make the choice
+        depend on total stream length.
+        """
+        size = len(pool)
+        if size == 0:
+            return None
+        window = min(self.config.recency_window, size)
+        return size - 1 - self._rng.randrange(window)
+
+    def _peek_recent(self, pool: list[str]) -> str | None:
+        """Choose from the recent tail without removing."""
+        index = self._pick_recent_index(pool)
+        return None if index is None else pool[index]
+
+    def _take_recent(self, pool: list[str], positions: dict[str, int]) -> str | None:
+        """Choose from the recent tail and remove it from the pool."""
+        index = self._pick_recent_index(pool)
+        if index is None:
+            return None
+        chosen = pool[index]
+        self._remove_at(index, pool, positions)
+        return chosen
+
+    def _drop(self, member: str, pool: list[str], positions: dict[str, int]) -> None:
+        index = positions.get(member)
+        if index is not None:
+            self._remove_at(index, pool, positions)
+
+    @staticmethod
+    def _remove_at(index: int, pool: list[str], positions: dict[str, int]) -> None:
+        """Remove by swapping the last element into the gap.
+
+        O(1) rather than O(n): list.remove would scan, and popping from the
+        middle would shift every later element and invalidate the position map.
+        """
+        last = pool[-1]
+        removed = pool[index]
+        pool[index] = last
+        positions[last] = index
+        pool.pop()
+        positions.pop(removed, None)
+        if removed == last:
+            positions.pop(last, None)
 
     def _advance_clock(self) -> None:
         """Move processing time forward by a small, seeded amount."""
