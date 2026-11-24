@@ -18,7 +18,7 @@ from datatrust.contracts import (
     PaymentCapturedV1,
     idempotency_key,
 )
-from datatrust.errors import ContractViolation, SchemaIncompatibility
+from datatrust.errors import ContractViolationError, SchemaIncompatibilityError
 
 pytestmark = pytest.mark.unit
 
@@ -32,7 +32,7 @@ class TestEnvelope:
                 event_type=EventType.ORDER,
                 schema_version=1,
                 entity_id="ord-1001",
-                event_timestamp=datetime(2026, 11, 23, 12, 0, 0),  # noqa: DTZ001
+                event_timestamp=datetime(2026, 11, 23, 12, 0, 0),
                 ingestion_timestamp=datetime.now(UTC),
                 payload=order_payload,
             )
@@ -50,7 +50,7 @@ class TestEnvelope:
 
     def test_unknown_envelope_fields_are_rejected(self, order_payload: dict) -> None:
         """extra='forbid' is what turns a producer typo into a visible failure."""
-        with pytest.raises(ValueError, match="extra_forbidden|Extra inputs"):
+        with pytest.raises(ValueError, match=r"extra_forbidden|Extra inputs"):
             EventEnvelope(
                 event_id="evt-1",
                 event_type=EventType.ORDER,
@@ -105,7 +105,7 @@ class TestOrderContract:
     def test_empty_line_list_is_rejected(self, order_payload: dict) -> None:
         order_payload["lines"] = []
         order_payload["gross_amount"] = "0.00"
-        with pytest.raises(ValueError, match="too_short|at least 1"):
+        with pytest.raises(ValueError, match=r"too_short|at least 1"):
             OrderPlacedV1.model_validate(order_payload)
 
     def test_money_keeps_two_decimal_places(self, order_payload: dict) -> None:
@@ -115,7 +115,7 @@ class TestOrderContract:
     def test_payload_is_frozen(self, order_payload: dict) -> None:
         """Raw evidence must stay immutable once parsed."""
         order = OrderPlacedV1.model_validate(order_payload)
-        with pytest.raises(ValueError, match="frozen|Instance is frozen"):
+        with pytest.raises(ValueError, match=r"frozen|Instance is frozen"):
             order.order_id = "tampered"
 
 
@@ -168,7 +168,7 @@ class TestRegistry:
         self, registry: ContractRegistry, make_envelope: Any, order_payload: dict
     ) -> None:
         envelope = make_envelope(order_payload, schema_version=7)
-        with pytest.raises(SchemaIncompatibility, match="no schema registered"):
+        with pytest.raises(SchemaIncompatibilityError, match="no schema registered"):
             registry.validate(envelope)
 
     def test_validate_returns_typed_payload(
@@ -181,7 +181,7 @@ class TestRegistry:
         self, registry: ContractRegistry, make_envelope: Any, order_payload: dict
     ) -> None:
         del order_payload["customer_id"]
-        with pytest.raises(ContractViolation) as caught:
+        with pytest.raises(ContractViolationError) as caught:
             registry.validate(make_envelope(order_payload))
         assert caught.value.field == "customer_id"
         assert caught.value.failures  # type: ignore[attr-defined]

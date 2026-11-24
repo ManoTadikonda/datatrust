@@ -329,7 +329,11 @@ class EventGenerator:
 
     def _envelope(
         self,
-        payload: OrderPlacedV2 | PaymentCapturedV1 | RefundIssuedV1 | CustomerUpdatedV1 | InventoryUpdatedV1,
+        payload: OrderPlacedV2
+        | PaymentCapturedV1
+        | RefundIssuedV1
+        | CustomerUpdatedV1
+        | InventoryUpdatedV1,
         *,
         entity_id: str,
         event_time: datetime,

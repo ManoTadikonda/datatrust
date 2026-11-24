@@ -166,7 +166,7 @@ class TestConfigValidation:
 
     def test_naive_start_time_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="timezone-aware"):
-            EventGenerator(start_time=datetime(2026, 11, 1))  # noqa: DTZ001
+            EventGenerator(start_time=datetime(2026, 11, 1))
 
     def test_negative_count_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):

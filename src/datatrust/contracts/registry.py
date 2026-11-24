@@ -25,7 +25,7 @@ from datatrust.contracts.events import (
     PaymentCapturedV1,
     RefundIssuedV1,
 )
-from datatrust.errors import ContractViolation, SchemaIncompatibility
+from datatrust.errors import ContractViolationError, SchemaIncompatibilityError
 
 
 class Compatibility(StrEnum):
@@ -92,7 +92,7 @@ class ContractRegistry:
             self.register(model)
 
     def model_for(self, event_type: EventType, version: int) -> type[EventPayload]:
-        """Return the model for a version, or raise :class:`SchemaIncompatibility`."""
+        """Return the model for a version, or raise :class:`SchemaIncompatibilityError`."""
         try:
             return self._models[(EventType(event_type), int(version))]
         except KeyError as exc:
@@ -101,7 +101,7 @@ class ContractRegistry:
                 f"no schema registered for {EventType(event_type).value} v{version}; "
                 f"known versions: {known or 'none'}"
             )
-            raise SchemaIncompatibility(msg) from exc
+            raise SchemaIncompatibilityError(msg) from exc
 
     def versions_for(self, event_type: EventType) -> list[int]:
         return sorted(v for (t, v) in self._models if t == EventType(event_type))
@@ -110,7 +110,7 @@ class ContractRegistry:
         versions = self.versions_for(event_type)
         if not versions:
             msg = f"no schema registered for {EventType(event_type).value}"
-            raise SchemaIncompatibility(msg)
+            raise SchemaIncompatibilityError(msg)
         return versions[-1]
 
     # -- validation ---------------------------------------------------------
@@ -118,8 +118,8 @@ class ContractRegistry:
     def validate(self, envelope: EventEnvelope) -> EventPayload:
         """Parse an envelope's payload against its declared contract.
 
-        Raises :class:`SchemaIncompatibility` when the version is unknown and
-        :class:`ContractViolation` when the payload fails the known contract.
+        Raises :class:`SchemaIncompatibilityError` when the version is unknown and
+        :class:`ContractViolationError` when the payload fails the known contract.
         Both are permanent errors: retrying an unreadable event does not make
         it readable, so the caller should quarantine rather than retry.
         """
@@ -133,7 +133,7 @@ class ContractRegistry:
                 f"{envelope.event_type.value} v{envelope.schema_version} "
                 f"failed contract: {first.message if first else 'unknown'}"
             )
-            violation = ContractViolation(msg, field=first.field_path if first else None)
+            violation = ContractViolationError(msg, field=first.field_path if first else None)
             violation.failures = failures  # type: ignore[attr-defined]
             raise violation from exc
 
@@ -145,7 +145,7 @@ class ContractRegistry:
         """
         try:
             model = self.model_for(envelope.event_type, envelope.schema_version)
-        except SchemaIncompatibility as exc:
+        except SchemaIncompatibilityError as exc:
             return [
                 ValidationFailure(
                     field_path="schema_version",
@@ -172,7 +172,7 @@ class ContractRegistry:
         """
         try:
             candidate = self.model_for(event_type, version)
-        except SchemaIncompatibility:
+        except SchemaIncompatibilityError:
             return Compatibility.UNKNOWN
 
         latest = self.model_for(event_type, self.latest_version(event_type))
@@ -277,7 +277,7 @@ def _class_literal(model: type[EventPayload], attr: str) -> Any:
     default = info.get_default(call_default_factory=False)
     if default is not None and default is not Ellipsis:
         return default
-    args = getattr(info.annotation, "__args__", ())
+    args: tuple[Any, ...] = getattr(info.annotation, "__args__", ())
     if len(args) == 1:
         return args[0]
     msg = f"{model.__name__}.{attr} must be a single-valued Literal with a default"

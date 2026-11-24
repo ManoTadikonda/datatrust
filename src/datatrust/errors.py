@@ -20,7 +20,7 @@ class PermanentError(DataTrustError):
     """A failure that retrying cannot fix (bad payload, incompatible schema)."""
 
 
-class ContractViolation(PermanentError):
+class ContractViolationError(PermanentError):
     """An event does not satisfy its declared data contract."""
 
     def __init__(self, message: str, *, field: str | None = None) -> None:
@@ -28,11 +28,11 @@ class ContractViolation(PermanentError):
         self.field = field
 
 
-class SchemaIncompatibility(PermanentError):
+class SchemaIncompatibilityError(PermanentError):
     """A schema version cannot be read by the current consumer."""
 
 
-class IllegalStateTransition(DataTrustError):
+class IllegalStateTransitionError(DataTrustError):
     """An incident was asked to move between two states that are not adjacent."""
 
     def __init__(self, current: str, requested: str) -> None:
@@ -41,9 +41,9 @@ class IllegalStateTransition(DataTrustError):
         self.requested = requested
 
 
-class RecoveryNotEligible(DataTrustError):
+class RecoveryNotEligibleError(DataTrustError):
     """Recovery was requested for an incident that policy forbids repairing."""
 
 
-class VerificationFailed(DataTrustError):
+class VerificationFailedError(DataTrustError):
     """A recovery completed but its independent verification did not pass."""
